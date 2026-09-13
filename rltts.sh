@@ -2,6 +2,8 @@
 
 MAX_JOBS=8          # 并发数
 SAMPLE_TIMES=3       # 每个域名握手耗时采样次数（仅在首次探测成功后进行）
+X25519_RETRY_TIMES=2
+XRAY_TLS_PING_TIMEOUT=12
 CONNECT_TIMEOUT=6
 MAX_TIME=10
 RETRY_TIMES=3        # 握手失败时的重试次数（含首次），提高容错，避免一次性网络抖动导致误判FAIL
@@ -14,6 +16,8 @@ RETRY_TIMES=3        # 握手失败时的重试次数（含首次），提高容
 #   2) IP段比对：Cloudflare这类不走自定义CNAME、直接用anycast IP的CDN，用官方公布的IP段来判。
 # 三种手段（CNAME/IP段/响应头）只要命中一种就判"是"，尽量降低漏判。
 DIG_AVAILABLE=1     # 由 check_deps 中检测到 dig 后决定是否开启
+XRAY_AVAILABLE=0     # 可选：用于官方 xray tls ping 检测
+SERVER_NAME=""      # 可选 SNI；为空时使用 target 本身
 CDN_CNAME_REGEX='akamai(edge|ized|hd)?\.net$|edgesuite\.net$|edgekey\.net$|akadns\.net$|cloudfront\.net$|fastly(lb)?\.net$|fastlyedge\.net$|azureedge\.net$|azurefd\.net$|msecnd\.net$|trafficmanager\.net$|incapdns\.net$|impervadns\.net$|sucuri\.net$|kxcdn\.com$|b-cdn\.net$|stackpathdns\.com$|hwcdn\.net$|cachefly\.net$|llnwd\.net$|footprint\.net$|edgecastcdn\.net$|cdn77\.(org|net)$|alikunlun\.com$|kunlun[a-z0-9]*\.com$|tbcache\.com$|wswitch\.[a-z0-9.]*cache\.com$|qcloudcdn\.com$|cdn\.dnsv1\.com$|tencent-cloud\.net$|bdydns\.com$|bcelive\.com$|chinacache\.net$|lxdns\.com$|ourwebpic\.com$|wsdvs\.com$|wscdns\.com$|wscloudcdn\.com$|upaiyun\.com$|qiniudns\.com$|qbox\.me$|jiashule\.(com|org)$|jiasule\.(com|org)$'
 CF_RANGES_CACHE_DIR="${TMPDIR:-/tmp}/reality_test_cf_ranges"
 CF_RANGES_TTL=86400   # Cloudflare官方IP段缓存有效期（秒），避免每次运行都重新拉取
@@ -61,21 +65,22 @@ pad_field() {
 # 最后一列(解析IP)不再补齐空格——反正后面没有别的列需要对齐，补了也是浪费宽度。
 print_row() {
     local color="${10}"
-    printf "%b%s | %s | %s | %s | %s | %s | %s | %s | %s%b\n" \
+    printf "%b%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s%b\n" \
         "$color" \
         "$(pad_field "$1" 30)" "$(pad_field "$2" 10)" "$(pad_field "$3" 5)" \
         "$(pad_field "$4" 5)" "$(pad_field "$5" 5)" "$(pad_field "$6" 5)" \
-        "$(pad_field "$7" 7)" "$(pad_field "$8" 9)" "$9" \
+        "$(pad_field "$7" 7)" "$(pad_field "$8" 9)" "$(pad_field "$9" 9)" "$(pad_field "${10}" 30)" "${11}" \
         "\033[0m"
 }
 
 # 窄终端（比如手机SSH客户端）下表格必然会被撑得换行、把每一列拆散对不齐，
 # 与其硬凑表格，不如每条记录单独输出几行——不管域名或IPv6多长，自然换行也不会破坏可读性。
 print_card() {
-    local dom="$1" tls="$2" alpn="$3" cf="$4" redirect="$5" x25519="$6" cert="$7" hs="$8" ip="$9" color="${10}"
+    local dom="$1" tls="$2" alpn="$3" cf="$4" redirect="$5" x25519="$6" cert="$7" hs="$8" ip="$9" sni="${10}" pq="${11}" color="${12}"
     printf "%b● %s\033[0m\n" "$color" "$dom"
-    printf "%b  TLS:%s ALPN:%s CDN:%s 跳转:%s X25519:%s 证书:%s\033[0m\n" \
-        "$color" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert"
+    printf "%b  TLS:%s ALPN:%s CDN:%s 跳转:%s X25519:%s 证书:%s PQ:%s\033[0m\n" \
+        "$color" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$pq"
+    printf "%b  SNI:%s\033[0m\n" "$color" "$sni"
     printf "%b  耗时:%s  IP:%s\033[0m\n" "$color" "$hs" "$ip"
 }
 
@@ -211,6 +216,7 @@ test_domain() {
     local x="$1"
     local stack="$2"
     local outfile="$3"
+    local sni="${SERVER_NAME:-$x}"
     local label="$x [IPv${stack}]"
     local stack_flag="-${stack}"
 
@@ -245,11 +251,19 @@ test_domain() {
     # 因为有些站点（反爬/WAF防护）会正常完成TLS握手，但后续HTTP层故意不响应导致curl整体超时，
     # 这种情况握手数据本身是有效的，不应该被当成完全失败丢弃。
     local attempt=0 curl_exit=1 o="" h="" ip=""
+    local curl_url="https://$x"
+    local curl_extra=()
+    if [ "$sni" != "$x" ]; then
+        curl_url="https://$sni"
+        curl_extra+=(--connect-to "${sni}:443:${x}:443")
+    fi
+
     while [ $attempt -lt $RETRY_TIMES ]; do
         o=$(curl -s -v $stack_flag --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" --tls-max 1.3 \
+                "${curl_extra[@]}" \
                 -I -o /dev/null \
                 -w "\n__META__ HANDSHAKE=%{time_appconnect} HTTPCODE=%{http_code} IP=%{remote_ip}\n" \
-                "https://$x" 2>&1)
+                "$curl_url" 2>&1)
         curl_exit=$?
         h=$(echo "$o" | grep -o "HANDSHAKE=[0-9.]*" | cut -d= -f2)
         [ -n "$h" ] && [ "$h" != "0.000000" ] && break
@@ -330,7 +344,7 @@ test_domain() {
     httpcode=$(echo "$o" | grep -o "HTTPCODE=[0-9]*" | cut -d= -f2)
     if [ "$http_responded" -eq 0 ]; then
         redirect="未知"
-    elif [[ "$httpcode" =~ ^3[0-9][0-9]$ ]]; then
+    elif [[ "$httpcode" =~ ^30[12378]$ ]]; then
         redirect="是"
         redirect_loc=$(echo "$o" | grep -i "^< location:" | head -n1 | sed 's/^< [Ll]ocation: *//I' | tr -d '\r\n')
         echo -e "\033[90m  ↳ $label 检测到跳转($httpcode): $redirect_loc\033[0m" >&2
@@ -343,7 +357,7 @@ test_domain() {
         local samples="$h" i hs
         for ((i = 1; i < SAMPLE_TIMES; i++)); do
             hs=$(curl -s -I -o /dev/null $stack_flag --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-                    --tls-max 1.3 -w "%{time_appconnect}" "https://$x" 2>/dev/null)
+                    --tls-max 1.3 "${curl_extra[@]}" -w "%{time_appconnect}" "$curl_url" 2>/dev/null)
             [ -n "$hs" ] && [ "$hs" != "0.000000" ] && samples="$samples $hs"
         done
         avg=$(echo "$samples" | awk '{s=0; for(i=1;i<=NF;i++) s+=$i; printf "%.3f", s/NF}')
@@ -378,15 +392,30 @@ test_domain() {
         fi
     fi
 
+    # ---------- 官方 Xray TLS ping（可选） ----------
+    # 官方文档建议用 xray tls ping target 检查 target 是否支持 X25519MLKEM768；
+    # 这里不把“未安装 xray”当成失败，只作为信息项。
+    local pq="未知" xray_ping="未检测"
+    if [ "$XRAY_AVAILABLE" -eq 1 ] && [ "$stack" = "4" ]; then
+        local ping_target="$x"
+        local ping_out
+        ping_out=$(timeout "$XRAY_TLS_PING_TIMEOUT" xray tls ping "$ping_target" 2>&1) || true
+        xray_ping="通过命令"
+        if echo "$ping_out" | grep -qiE 'X25519MLKEM768|X25519.*MLKEM|MLKEM768'; then
+            pq="是"
+        elif echo "$ping_out" | grep -qiE 'X25519'; then
+            pq="否/未发现MLKEM768"
+        else
+            pq="未知"
+        fi
+        echo -e "\033[90m  ↳ $label xray tls ping: X25519MLKEM768=$pq\033[0m" >&2
+    fi
+
     # 五档状态：
-    # 3=不合格——只要满足以下任意一条就直接判不合格（不需要同时满足）：
-    #     a) TLS版本不是1.3
-    #     b) 明确检测到使用了CDN
-    #     c) 明确检测到域名跳转（301/302等，社区共识：跳转用域名不能做dest，跟CDN同级的硬性条件）
-    #     d) 证书不合法（链不受信）或不在有效期内（已过期/未生效）
-    #     e) 明确检测到不支持X25519
-    # 1=合格但ALPN不是h2——单独拎出来标黄，因为非h2的站点有些实际也能用，不直接判死
-    # 0=完全合格（TLS1.3 + 非CDN + 非跳转 + 证书合法有效 + 支持X25519 + h2）
+    # 3=不合格候选：TLS非1.3、明确CDN、明确301/302/303/307/308、证书失效、明确不支持X25519
+    # 1=可用但需人工确认：ALPN非h2或关键项未知；这些属于target质量/兼容性判断，不等同于协议“硬规范”
+    # 0=推荐候选：TLS1.3 + 非CDN + 非跳转 + 证书有效 + X25519 + h2
+    # PQ(X25519MLKEM768)仅作信息项；官方说明 target 支持时 REALITY 客户端会自动使用。
     # 4=该协议栈无DNS记录（在上面已提前返回，这里不会用到）
     local status x25519="未知"
 
@@ -404,7 +433,7 @@ test_domain() {
             local x_ok=1 x_try
             for ((x_try = 0; x_try < 2; x_try++)); do
                 if curl -s -o /dev/null $stack_flag --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-                        --tls-max 1.3 --curves X25519 -I "https://$x" >/dev/null 2>&1; then
+                        --tls-max 1.3 --curves X25519 "${curl_extra[@]}" -I "$curl_url" >/dev/null 2>&1; then
                     x_ok=0
                     break
                 fi
@@ -431,7 +460,7 @@ test_domain() {
         fi
     fi
 
-    echo "$status|$label|$t|$a|$c|$redirect|$x25519|$cert_status|$avg|$ip" >> "$outfile"
+    echo "$status|$label|$t|$a|$c|$redirect|$x25519|$cert_status|$avg|$ip|$sni|$pq" >> "$outfile"
     case "$status" in
         0) echo -e "\033[32m✓ 完成: $label (合格)\033[0m" >&2 ;;
         1) echo -e "\033[33m⚠ 完成: $label (需人工确认: 非h2 或 存在未知项)\033[0m" >&2 ;;
@@ -471,6 +500,8 @@ while true; do
 
     [ -z "$d" ] && continue
 
+    read -r -p $'可选 SNI/serverName（留空=每个 target 自己；多个域名共用时建议填证书 SAN 中的域名）: ' SERVER_NAME
+
     tmp_dir=$(mktemp -d)
     result_file="$tmp_dir/results.txt"
     touch "$result_file"
@@ -496,11 +527,11 @@ while true; do
 
     echo ""
     if [ "$TABLE_MODE" -eq 1 ]; then
-        print_row "域名" "TLS版本" "ALPN" "CDN" "跳转" "X25519" "证书" "平均耗时" "解析IP" "\033[1;33m"
+        print_row "域名" "TLS版本" "ALPN" "CDN" "跳转" "X25519" "证书" "平均耗时" "解析IP" "SNI" "PQ" "\033[1;33m"
         echo -e "\033[1;33m----------------------------------------------------------------------------------------------------\033[0m"
     fi
 
-    sort -t'|' -k1,1n -k9,9n "$result_file" | while IFS='|' read -r status dom tls alpn cf redirect x25519 cert hs ip; do
+    sort -t'|' -k1,1n -k9,9n "$result_file" | while IFS='|' read -r status dom tls alpn cf redirect x25519 cert hs ip sni pq; do
         case "$status" in
             0) color="\033[1;32m" ;;
             1) color="\033[1;33m" ;;
@@ -513,14 +544,14 @@ while true; do
             hs="${hs}s"
         fi
         if [ "$TABLE_MODE" -eq 1 ]; then
-            print_row "$dom" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$ip" "$color"
+            print_row "$dom" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$ip" "$sni" "$pq" "$color"
         else
-            print_card "$dom" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$ip" "$color"
+            print_card "$dom" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$ip" "$sni" "$pq" "$color"
         fi
     done
     echo -e "\033[32m■\033[0m 合格   \033[1;33m■\033[0m 需人工确认(非h2/存在未知项)   \033[90m■\033[0m 不合格(非TLS1.3/确认CDN/确认跳转/证书不合法或无效/确认非X25519)   \033[36m■\033[0m 无DNS记录"
-    echo -e "\033[2m  注: CDN列综合了CNAME链追溯/Cloudflare官方IP段/响应头特征三种信号；跳转列命中301/302等会直接判不合格（域名跳转不适合做dest），\033[0m"
-    echo -e "\033[2m      具体跳转目标见上方逐条测试日志（终端stderr）。如需进一步确认后量子密钥交换(X25519MLKEM768)支持情况，官方建议额外执行: xray tls ping <域名>\033[0m"
+    echo -e "\033[2m  注: CDN列综合CNAME/Cloudflare官方IP段/响应头；跳转仅判301/302/303/307/308。SNI可单独指定，默认等于target。\033[0m"
+    echo -e "\033[2m      PQ列来自可选的官方 xray tls ping；未安装xray时为“未检测”，不会因此判失败。官方文档明确建议用该命令检查 X25519MLKEM768。\033[0m"
 
     rm -rf "$tmp_dir"
 done
