@@ -2,8 +2,9 @@
 
 MAX_JOBS=8          # 并发数
 SAMPLE_TIMES=3       # 每个域名握手耗时采样次数（仅在首次探测成功后进行）
-CONNECT_TIMEOUT=5
-MAX_TIME=8
+CONNECT_TIMEOUT=6
+MAX_TIME=10
+RETRY_TIMES=3        # 握手失败时的重试次数（含首次），提高容错，避免一次性网络抖动导致误判FAIL
 
 # ---------- 中英文混排对齐 ----------
 # 检测一个可用的 UTF-8 locale，用于正确计算中文字符的显示宽度
@@ -134,7 +135,7 @@ test_domain() {
     # 因为有些站点（反爬/WAF防护）会正常完成TLS握手，但后续HTTP层故意不响应导致curl整体超时，
     # 这种情况握手数据本身是有效的，不应该被当成完全失败丢弃。
     local attempt=0 curl_exit=1 o="" h="" ip=""
-    while [ $attempt -lt 2 ]; do
+    while [ $attempt -lt $RETRY_TIMES ]; do
         o=$(curl -s -v $stack_flag --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" --tls-max 1.3 \
                 -I -o /dev/null \
                 -w "\n__META__ HANDSHAKE=%{time_appconnect} HTTPCODE=%{http_code} IP=%{remote_ip}\n" \
@@ -192,43 +193,52 @@ test_domain() {
         avg=$(echo "$samples" | awk '{s=0; for(i=1;i<=NF;i++) s+=$i; printf "%.3f", s/NF}')
     fi
 
-    # 五档状态：
-    # 0=完全OK（握手+HTTP均正常，确认非CF，且支持X25519）
-    # 1=握手层基本达标但存在不确定项——HTTP无响应(CF未知)，或X25519不支持/无法验证，需人工确认
-    # 2=握手+HTTP都正常，但明确检测到是Cloudflare——已经查清楚了，不是"不确定"，是确定不建议用
-    # 3=握手本身不达标（真正的失败）
+    # 四档状态：
+    # 0=完全OK（TLS1.3+h2+HTTP正常响应+确认非CF，待X25519复核）
+    # 1=不确定，需人工确认——非h2（有些非h2的站点实际也能用，不直接判死），或HTTP无响应导致CF状态测不出来
+    # 3=不能用——握手本身失败，或者已经明确查清楚是CF，或者明确查清楚不支持X25519（这三种原因不同，
+    #   但结论都是"不能用"，所以统一用同一个颜色，不再单独区分）
     # 4=该协议栈无DNS记录（在上面已提前返回，这里不会用到）
     local status
-    if [ "$http_responded" -eq 1 ] && [ "$t" = "TLSv1.3" ] && [ "$a" = "h2" ] && [ "$c" = "否" ]; then
-        status=0
-    elif [ "$http_responded" -eq 1 ] && [ "$t" = "TLSv1.3" ] && [ "$a" = "h2" ] && [ "$c" = "是" ]; then
-        status=2
-    elif [ "$t" = "TLSv1.3" ] && [ "$a" = "h2" ]; then
-        status=1
-    else
+    if [ "$t" != "TLSv1.3" ]; then
         status=3
+    elif [ "$a" != "h2" ]; then
+        status=1
+    elif [ "$http_responded" -ne 1 ]; then
+        status=1
+    elif [ "$c" = "是" ]; then
+        status=3
+    else
+        status=0
     fi
 
-    # X25519 密钥交换检测：仅对已经初步达标的候选（status 0/1）做进一步验证，
+    # X25519 密钥交换检测：仅对还有希望的候选（status 0/1）做进一步验证，
     # 用 --curves X25519 强制只提供该曲线，握手能成功就说明服务端支持X25519。
-    # status 0要求这一项也必须通过，否则降级为1（不确定/需人工确认），并说明原因。
+    # 加一次重试，避免偶发网络抖动导致误判。
+    # 只要明确测出不支持X25519，不管之前是绿是黄，一律归到"不能用"这一档。
     local x25519="未知"
     if [ "$CURVES_SUPPORTED" -eq 1 ] && { [ "$status" -eq 0 ] || [ "$status" -eq 1 ]; }; then
-        if curl -s -o /dev/null $stack_flag --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-                --tls-max 1.3 --curves X25519 -I "https://$x" >/dev/null 2>&1; then
+        local x_ok=1 x_try
+        for ((x_try = 0; x_try < 2; x_try++)); do
+            if curl -s -o /dev/null $stack_flag --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+                    --tls-max 1.3 --curves X25519 -I "https://$x" >/dev/null 2>&1; then
+                x_ok=0
+                break
+            fi
+        done
+        if [ "$x_ok" -eq 0 ]; then
             x25519="是"
         else
             x25519="否"
-            [ "$status" -eq 0 ] && status=1
+            status=3
         fi
     fi
 
     echo "$status|$label|$t|$a|$c|$avg|$ip|$x25519" >> "$outfile"
     case "$status" in
         0) echo -e "\033[32m✓ 完成: $label (OK)\033[0m" >&2 ;;
-        1) echo -e "\033[33m⚠ 完成: $label (需人工确认: HTTP无响应或X25519不支持)\033[0m" >&2 ;;
-        2) echo -e "\033[38;5;92m✗ 完成: $label (确认是Cloudflare，不建议用)\033[0m" >&2 ;;
-        *) echo -e "\033[90m✓ 完成: $label (FAIL)\033[0m" >&2 ;;
+        1) echo -e "\033[33m⚠ 完成: $label (需人工确认: 非h2 或 HTTP无响应)\033[0m" >&2 ;;
+        *) echo -e "\033[90m✗ 完成: $label (不能用)\033[0m" >&2 ;;
     esac
 }
 
@@ -282,7 +292,6 @@ while true; do
         case "$status" in
             0) color="\033[1;32m" ;;
             1) color="\033[1;33m" ;;
-            2) color="\033[38;5;92m" ;;
             4) color="\033[36m" ;;
             *) color="\033[90m" ;;
         esac
@@ -292,7 +301,7 @@ while true; do
             print_row "$dom" "$tls" "$alpn" "$cf" "$x25519" "${hs}s" "$ip" "$color"
         fi
     done
-    echo -e "\033[32m■\033[0m OK(含X25519)   \033[1;33m■\033[0m 需人工确认   \033[38;5;92m■\033[0m 确认是CF(不建议用)   \033[90m■\033[0m 失败   \033[36m■\033[0m 无DNS记录"
+    echo -e "\033[32m■\033[0m OK   \033[1;33m■\033[0m 需人工确认(非h2/HTTP无响应)   \033[90m■\033[0m 不能用(握手失败/确认CF/确认非X25519)   \033[36m■\033[0m 无DNS记录"
 
     rm -rf "$tmp_dir"
 done
