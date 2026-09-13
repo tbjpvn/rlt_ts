@@ -50,7 +50,7 @@ print_row() {
     printf "%b%s | %s | %s | %s | %s | %s | %s | %s%b\n" \
         "$color" \
         "$(pad_field "$1" 34)" "$(pad_field "$2" 9)" "$(pad_field "$3" 7)" \
-        "$(pad_field "$4" 11)" "$(pad_field "$5" 8)" "$(pad_field "$6" 10)" \
+        "$(pad_field "$4" 6)" "$(pad_field "$5" 8)" "$(pad_field "$6" 8)" \
         "$(pad_field "$7" 10)" "$(pad_field "$8" 15)" \
         "\033[0m"
 }
@@ -318,8 +318,8 @@ while true; do
     wait
 
     echo ""
-    print_row "域名" "TLS版本" "ALPN" "Cloudflare" "X25519" "证书有效期" "平均耗时" "解析IP" "\033[1;33m"
-    echo -e "\033[1;33m--------------------------------------------------------------------------------------------------------\033[0m"
+    print_row "域名" "TLS版本" "ALPN" "CF" "X25519" "证书" "平均耗时" "解析IP" "\033[1;33m"
+    echo -e "\033[1;33m----------------------------------------------------------------------------------------------\033[0m"
 
     sort -t'|' -k1,1n -k8,8n "$result_file" | while IFS='|' read -r status dom tls alpn cf x25519 cert hs ip; do
         case "$status" in
