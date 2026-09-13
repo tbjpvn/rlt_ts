@@ -194,51 +194,51 @@ test_domain() {
     fi
 
     # 四档状态：
-    # 0=完全OK（TLS1.3+h2+HTTP正常响应+确认非CF，待X25519复核）
-    # 1=不确定，需人工确认——非h2（有些非h2的站点实际也能用，不直接判死），或HTTP无响应导致CF状态测不出来
-    # 3=不能用——握手本身失败，或者已经明确查清楚是CF，或者明确查清楚不支持X25519（这三种原因不同，
-    #   但结论都是"不能用"，所以统一用同一个颜色，不再单独区分）
+    # 3=不合格——只要满足以下任意一条就直接判不合格（不需要同时满足）：
+    #     a) TLS版本不是1.3
+    #     b) 明确检测到是Cloudflare
+    #     c) 明确检测到不支持X25519
+    # 1=合格但ALPN不是h2——单独拎出来标黄，因为非h2的站点有些实际也能用，不直接判死
+    # 0=完全合格（TLS1.3 + 非CF + 支持X25519 + h2）
     # 4=该协议栈无DNS记录（在上面已提前返回，这里不会用到）
-    local status
+    local status x25519="未知"
+
     if [ "$t" != "TLSv1.3" ]; then
         status=3
-    elif [ "$a" != "h2" ]; then
-        status=1
-    elif [ "$http_responded" -ne 1 ]; then
-        status=1
     elif [ "$c" = "是" ]; then
         status=3
     else
-        status=0
-    fi
-
-    # X25519 密钥交换检测：仅对还有希望的候选（status 0/1）做进一步验证，
-    # 用 --curves X25519 强制只提供该曲线，握手能成功就说明服务端支持X25519。
-    # 加一次重试，避免偶发网络抖动导致误判。
-    # 只要明确测出不支持X25519，不管之前是绿是黄，一律归到"不能用"这一档。
-    local x25519="未知"
-    if [ "$CURVES_SUPPORTED" -eq 1 ] && { [ "$status" -eq 0 ] || [ "$status" -eq 1 ]; }; then
-        local x_ok=1 x_try
-        for ((x_try = 0; x_try < 2; x_try++)); do
-            if curl -s -o /dev/null $stack_flag --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-                    --tls-max 1.3 --curves X25519 -I "https://$x" >/dev/null 2>&1; then
-                x_ok=0
-                break
+        # TLS1.3确认成立，且不是明确的CF（可能是"否"或"未知"），继续查X25519
+        if [ "$CURVES_SUPPORTED" -eq 1 ]; then
+            local x_ok=1 x_try
+            for ((x_try = 0; x_try < 2; x_try++)); do
+                if curl -s -o /dev/null $stack_flag --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+                        --tls-max 1.3 --curves X25519 -I "https://$x" >/dev/null 2>&1; then
+                    x_ok=0
+                    break
+                fi
+            done
+            if [ "$x_ok" -eq 0 ]; then
+                x25519="是"
+            else
+                x25519="否"
             fi
-        done
-        if [ "$x_ok" -eq 0 ]; then
-            x25519="是"
-        else
-            x25519="否"
+        fi
+
+        if [ "$x25519" = "否" ]; then
             status=3
+        elif [ "$a" != "h2" ]; then
+            status=1
+        else
+            status=0
         fi
     fi
 
     echo "$status|$label|$t|$a|$c|$avg|$ip|$x25519" >> "$outfile"
     case "$status" in
-        0) echo -e "\033[32m✓ 完成: $label (OK)\033[0m" >&2 ;;
-        1) echo -e "\033[33m⚠ 完成: $label (需人工确认: 非h2 或 HTTP无响应)\033[0m" >&2 ;;
-        *) echo -e "\033[90m✗ 完成: $label (不能用)\033[0m" >&2 ;;
+        0) echo -e "\033[32m✓ 完成: $label (合格)\033[0m" >&2 ;;
+        1) echo -e "\033[33m⚠ 完成: $label (合格但非h2)\033[0m" >&2 ;;
+        *) echo -e "\033[90m✗ 完成: $label (不合格)\033[0m" >&2 ;;
     esac
 }
 
@@ -301,7 +301,7 @@ while true; do
             print_row "$dom" "$tls" "$alpn" "$cf" "$x25519" "${hs}s" "$ip" "$color"
         fi
     done
-    echo -e "\033[32m■\033[0m OK   \033[1;33m■\033[0m 需人工确认(非h2/HTTP无响应)   \033[90m■\033[0m 不能用(握手失败/确认CF/确认非X25519)   \033[36m■\033[0m 无DNS记录"
+    echo -e "\033[32m■\033[0m 合格   \033[1;33m■\033[0m 合格但非h2   \033[90m■\033[0m 不合格(非TLS1.3/确认CF/确认非X25519)   \033[36m■\033[0m 无DNS记录"
 
     rm -rf "$tmp_dir"
 done
