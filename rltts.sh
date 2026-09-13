@@ -265,12 +265,18 @@ test_domain() {
         else
             status=0
         fi
+
+        # 兜底检查：只要CF、X25519、证书这几项里有任何一项是"未知"（没能确认清楚），
+        # 就不能算完全合格，哪怕其它条件都过了，也要降到黄色去人工确认
+        if [ "$status" -eq 0 ] && { [ "$c" = "未知" ] || [ "$x25519" = "未知" ] || [ "$cert_status" = "未知" ]; }; then
+            status=1
+        fi
     fi
 
     echo "$status|$label|$t|$a|$c|$x25519|$cert_status|$avg|$ip" >> "$outfile"
     case "$status" in
         0) echo -e "\033[32m✓ 完成: $label (合格)\033[0m" >&2 ;;
-        1) echo -e "\033[33m⚠ 完成: $label (合格但非h2)\033[0m" >&2 ;;
+        1) echo -e "\033[33m⚠ 完成: $label (需人工确认: 非h2 或 存在未知项)\033[0m" >&2 ;;
         *) echo -e "\033[90m✗ 完成: $label (不合格)\033[0m" >&2 ;;
     esac
 }
@@ -334,7 +340,7 @@ while true; do
             print_row "$dom" "$tls" "$alpn" "$cf" "$x25519" "$cert" "${hs}s" "$ip" "$color"
         fi
     done
-    echo -e "\033[32m■\033[0m 合格   \033[1;33m■\033[0m 合格但非h2   \033[90m■\033[0m 不合格(非TLS1.3/确认CF/证书不合法或无效/确认非X25519)   \033[36m■\033[0m 无DNS记录"
+    echo -e "\033[32m■\033[0m 合格   \033[1;33m■\033[0m 需人工确认(非h2/存在未知项)   \033[90m■\033[0m 不合格(非TLS1.3/确认CF/证书不合法或无效/确认非X25519)   \033[36m■\033[0m 无DNS记录"
 
     rm -rf "$tmp_dir"
 done
