@@ -23,7 +23,8 @@ CF_RANGES_CACHE_DIR="${TMPDIR:-/tmp}/reality_test_cf_ranges"
 CF_RANGES_TTL=86400   # Cloudflare官方IP段缓存有效期（秒），避免每次运行都重新拉取
 
 # ---------- 中英文混排对齐 ----------
-# 检测一个可用的 UTF-8 locale，用于正确计算中文字符的显示宽度
+# 表格采用“主表 + 明细行”：主表只放最关键字段，避免域名/IPv6/SNI把终端撑爆。
+# 明细行单独显示解析IP、SNI、PQ，这样即使IPv6很长也不会破坏主表对齐。
 UTF8_LOCALE=""
 detect_utf8_locale() {
     local loc cc
@@ -36,7 +37,6 @@ detect_utf8_locale() {
     done
 }
 
-# 计算字符串的终端显示宽度（中文等宽字符按2列计算，ASCII按1列）
 str_width() {
     local s="$1"
     if [ -z "$UTF8_LOCALE" ]; then
@@ -51,37 +51,39 @@ str_width() {
     echo $(( (cc + bc) / 2 ))
 }
 
-# 按显示宽度右侧补空格对齐（而非按字节/字符数对齐，避免中英文混排时错位）
 pad_field() {
     local s="$1" target="$2" vw sp
     vw=$(str_width "$s")
     sp=$((target - vw))
-    [ $sp -lt 0 ] && sp=0
+    [ "$sp" -lt 0 ] && sp=0
     printf '%s%*s' "$s" "$sp" ""
 }
 
-# 打印表格一行，$1-$9 为各列内容，$10 为颜色码。
-# 各列宽度按实际会出现的最长内容收紧过（比如"证书"最长是"不合法/已过期/未生效"六个显示宽度），
-# 最后一列(解析IP)不再补齐空格——反正后面没有别的列需要对齐，补了也是浪费宽度。
+# 主表列宽刻意压缩到约 95 列以内；IP/SNI/PQ 放到下一行明细。
+# 参数：域名、协议栈、结果、TLS、ALPN、CDN、跳转、X25519、证书、耗时、颜色
 print_row() {
-    local color="${10}"
+    local color="${11}"
     printf "%b%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s%b\n" \
         "$color" \
-        "$(pad_field "$1" 30)" "$(pad_field "$2" 10)" "$(pad_field "$3" 5)" \
-        "$(pad_field "$4" 5)" "$(pad_field "$5" 5)" "$(pad_field "$6" 5)" \
-        "$(pad_field "$7" 7)" "$(pad_field "$8" 9)" "$(pad_field "$9" 9)" "$(pad_field "${10}" 30)" "${11}" \
+        "$(pad_field "$1" 28)" "$(pad_field "$2" 4)" "$(pad_field "$3" 8)" \
+        "$(pad_field "$4" 8)" "$(pad_field "$5" 5)" "$(pad_field "$6" 3)" \
+        "$(pad_field "$7" 4)" "$(pad_field "$8" 6)" "$(pad_field "$9" 6)" \
+        "$(pad_field "${10}" 7)" \
         "\033[0m"
 }
 
-# 窄终端（比如手机SSH客户端）下表格必然会被撑得换行、把每一列拆散对不齐，
-# 与其硬凑表格，不如每条记录单独输出几行——不管域名或IPv6多长，自然换行也不会破坏可读性。
+print_detail() {
+    local ip="$1" sni="$2" pq="$3" color="$4"
+    printf "%b    IP:%s  SNI:%s  PQ:%s\033[0m\n" "$color" "$ip" "$sni" "$pq"
+}
+
 print_card() {
-    local dom="$1" tls="$2" alpn="$3" cf="$4" redirect="$5" x25519="$6" cert="$7" hs="$8" ip="$9" sni="${10}" pq="${11}" color="${12}"
-    printf "%b● %s\033[0m\n" "$color" "$dom"
-    printf "%b  TLS:%s ALPN:%s CDN:%s 跳转:%s X25519:%s 证书:%s PQ:%s\033[0m\n" \
-        "$color" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$pq"
-    printf "%b  SNI:%s\033[0m\n" "$color" "$sni"
+    local dom="$1" stack="$2" status="$3" tls="$4" alpn="$5" cf="$6" redirect="$7" x25519="$8" cert="$9" hs="${10}" ip="${11}" sni="${12}" pq="${13}" color="${14}"
+    printf "%b● %s [IPv%s]  %s\033[0m\n" "$color" "$dom" "$stack" "$status"
+    printf "%b  TLS:%s ALPN:%s CDN:%s 跳转:%s X25519:%s 证书:%s\033[0m\n" \
+        "$color" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert"
     printf "%b  耗时:%s  IP:%s\033[0m\n" "$color" "$hs" "$ip"
+    printf "%b  SNI:%s  PQ:%s\033[0m\n" "$color" "$sni" "$pq"
 }
 
 # ---------- 依赖检查 ----------
@@ -223,7 +225,7 @@ test_domain() {
     echo -e "\033[36m▶ 开始测试: $label\033[0m" >&2
 
     if ! is_valid_domain "$x"; then
-        echo "3|$label|格式错误|-|-|-|-|9999|-|-" >> "$outfile"
+        echo "3|$label|格式错误|-|-|-|-|-|9999|-|$sni|-" >> "$outfile"
         echo -e "\033[90m✗ 域名格式无效: $label\033[0m" >&2
         return
     fi
@@ -233,13 +235,13 @@ test_domain() {
     if command -v getent >/dev/null 2>&1; then
         if [ "$stack" = "6" ]; then
             if ! getent ahostsv6 "$x" >/dev/null 2>&1; then
-                echo "4|$label|无AAAA记录|-|-|-|-|9999|-|-" >> "$outfile"
+                echo "4|$label|无AAAA记录|-|-|-|-|-|9999|-|$sni|-" >> "$outfile"
                 echo -e "\033[90m○ 无IPv6记录: $label\033[0m" >&2
                 return
             fi
         else
             if ! getent ahostsv4 "$x" >/dev/null 2>&1; then
-                echo "4|$label|无A记录|-|-|-|-|9999|-|-" >> "$outfile"
+                echo "4|$label|无A记录|-|-|-|-|-|9999|-|$sni|-" >> "$outfile"
                 echo -e "\033[90m○ 无IPv4记录: $label\033[0m" >&2
                 return
             fi
@@ -272,7 +274,7 @@ test_domain() {
 
     # 只有真正连握手都没完成（DNS失败/连接拒绝/握手阶段超时）才算彻底失败
     if [ -z "$h" ] || [ "$h" = "0.000000" ]; then
-        echo "3|$label|失败|-|-|-|-|9999|-|-" >> "$outfile"
+        echo "3|$label|失败|-|-|-|-|-|9999|-|$sni|-" >> "$outfile"
         echo -e "\033[90m✗ 连接失败(握手未完成): $label\033[0m" >&2
         return
     fi
@@ -411,27 +413,32 @@ test_domain() {
         echo -e "\033[90m  ↳ $label xray tls ping: X25519MLKEM768=$pq\033[0m" >&2
     fi
 
-    # 五档状态：
-    # 3=不合格候选：TLS非1.3、明确CDN、明确301/302/303/307/308、证书失效、明确不支持X25519
-    # 1=可用但需人工确认：ALPN非h2或关键项未知；这些属于target质量/兼容性判断，不等同于协议“硬规范”
-    # 0=推荐候选：TLS1.3 + 非CDN + 非跳转 + 证书有效 + X25519 + h2
-    # PQ(X25519MLKEM768)仅作信息项；官方说明 target 支持时 REALITY 客户端会自动使用。
-    # 4=该协议栈无DNS记录（在上面已提前返回，这里不会用到）
-    local status x25519="未知"
+    # ---------- 最终判定：硬条件一票否决，其余只做提示 ----------
+    # 3=不合格：TLS不是1.3、明确CDN、明确301/302/303/307/308、证书明确失效。
+    # 1=可用但有警告：H2缺失、X25519未知/不支持、CDN/跳转/证书无法确认等。
+    # 0=推荐：硬条件全部通过；H2/X25519确认越完整，推荐度越高。
+    # 4=该协议栈无DNS记录。
+    # 注意：X25519 不再作为硬性淘汰条件；PQ 更只是信息项。
+    local status x25519="未知" warn=""
 
     if [ "$t" != "TLSv1.3" ]; then
         status=3
+        warn="TLS非1.3"
     elif [ "$c" = "是" ]; then
         status=3
+        warn="确认CDN"
     elif [ "$redirect" = "是" ]; then
         status=3
+        warn="确认跳转"
     elif [ "$cert_status" = "不合法" ] || [ "$cert_status" = "已过期" ] || [ "$cert_status" = "未生效" ]; then
         status=3
+        warn="证书无效"
     else
-        # TLS1.3确认成立，非CDN，非跳转，证书合法且在有效期内，继续查X25519
+        # TLS1.3 + 非确认CDN + 非确认跳转 + 证书没有明确失效 => 保留候选。
+        # X25519仅作兼容性/质量提示，不再因此淘汰。
         if [ "$CURVES_SUPPORTED" -eq 1 ]; then
             local x_ok=1 x_try
-            for ((x_try = 0; x_try < 2; x_try++)); do
+            for ((x_try = 0; x_try < X25519_RETRY_TIMES; x_try++)); do
                 if curl -s -o /dev/null $stack_flag --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
                         --tls-max 1.3 --curves X25519 "${curl_extra[@]}" -I "$curl_url" >/dev/null 2>&1; then
                     x_ok=0
@@ -445,19 +452,14 @@ test_domain() {
             fi
         fi
 
-        if [ "$x25519" = "否" ]; then
-            status=3
-        elif [ "$a" != "h2" ]; then
-            status=1
-        else
-            status=0
-        fi
-
-        # 兜底检查：只要CDN、跳转、X25519、证书这几项里有任何一项是"未知"（没能确认清楚），
-        # 就不能算完全合格，哪怕其它条件都过了，也要降到黄色去人工确认
-        if [ "$status" -eq 0 ] && { [ "$c" = "未知" ] || [ "$redirect" = "未知" ] || [ "$x25519" = "未知" ] || [ "$cert_status" = "未知" ]; }; then
-            status=1
-        fi
+        status=0
+        [ "$a" != "h2" ] && warn="${warn:+$warn；}非h2"
+        [ "$x25519" = "否" ] && warn="${warn:+$warn；}X25519未确认"
+        [ "$x25519" = "未知" ] && warn="${warn:+$warn；}X25519未知"
+        [ "$c" = "未知" ] && warn="${warn:+$warn；}CDN未知"
+        [ "$redirect" = "未知" ] && warn="${warn:+$warn；}跳转未知"
+        [ "$cert_status" = "未知" ] && warn="${warn:+$warn；}证书未知"
+        [ -n "$warn" ] && status=1
     fi
 
     echo "$status|$label|$t|$a|$c|$redirect|$x25519|$cert_status|$avg|$ip|$sni|$pq" >> "$outfile"
@@ -477,7 +479,7 @@ detect_utf8_locale
 # 不如自动降级成每条记录几行的紧凑格式，内容多长都不影响可读性。
 TERM_COLS=$(tput cols 2>/dev/null)
 [[ "$TERM_COLS" =~ ^[0-9]+$ ]] || TERM_COLS=80
-TABLE_MIN_COLS=120   # 表格全部列宽之和 + 一个较长IPv6地址，大致需要这个宽度才不会换行
+TABLE_MIN_COLS=100   # 主表不再塞入IP/SNI，普通SSH终端约100列即可保持整齐
 if [ "$TERM_COLS" -lt "$TABLE_MIN_COLS" ]; then
     TABLE_MODE=0
     echo -e "\033[1;33m[提示] 检测到终端宽度($TERM_COLS列)较窄，结果将以紧凑卡片格式显示而非表格。\033[0m" >&2
@@ -500,7 +502,7 @@ while true; do
 
     [ -z "$d" ] && continue
 
-    read -r -p $'可选 SNI/serverName（留空=每个 target 自己；多个域名共用时建议填证书 SAN 中的域名）: ' SERVER_NAME
+    read -r -p $'可选 SNI/serverName（直接回车=每个 target 自己；仅在目标接受该 SNI 时填写）: ' SERVER_NAME
 
     tmp_dir=$(mktemp -d)
     result_file="$tmp_dir/results.txt"
@@ -527,31 +529,36 @@ while true; do
 
     echo ""
     if [ "$TABLE_MODE" -eq 1 ]; then
-        print_row "域名" "TLS版本" "ALPN" "CDN" "跳转" "X25519" "证书" "平均耗时" "解析IP" "SNI" "PQ" "\033[1;33m"
-        echo -e "\033[1;33m----------------------------------------------------------------------------------------------------\033[0m"
+        print_row "域名" "栈" "结果" "TLS" "ALPN" "CDN" "跳转" "X25519" "证书" "耗时" "\033[1;33m"
+        echo -e "\033[1;33m-----------------------------------------------------------------------------------------------\033[0m"
     fi
 
     sort -t'|' -k1,1n -k9,9n "$result_file" | while IFS='|' read -r status dom tls alpn cf redirect x25519 cert hs ip sni pq; do
         case "$status" in
-            0) color="\033[1;32m" ;;
-            1) color="\033[1;33m" ;;
-            4) color="\033[36m" ;;
-            *) color="\033[90m" ;;
+            0) color="\033[1;32m"; result_label="推荐" ;;
+            1) color="\033[1;33m"; result_label="可用/警告" ;;
+            4) color="\033[36m"; result_label="无DNS" ;;
+            *) color="\033[90m"; result_label="不合格" ;;
         esac
+        stack=$(printf '%s' "$dom" | sed -n 's/.*\[IPv\([46]\)\]$/\1/p')
+        [ -z "$stack" ] && stack="?"
+        clean_dom=$(printf '%s' "$dom" | sed 's/ \[IPv[46]\]$//')
         if [ "$status" = "4" ]; then
-            alpn="-"; cf="-"; redirect="-"; x25519="-"; cert="-"; hs="-"; ip="-"
+            alpn="-"; cf="-"; redirect="-"; x25519="-"; cert="-"; hs="-"; ip="-"; sni="-"; pq="-"
         else
             hs="${hs}s"
         fi
         if [ "$TABLE_MODE" -eq 1 ]; then
-            print_row "$dom" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$ip" "$sni" "$pq" "$color"
+            print_row "$clean_dom" "IPv$stack" "$result_label" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$color"
+            print_detail "$ip" "$sni" "$pq" "$color"
         else
-            print_card "$dom" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$ip" "$sni" "$pq" "$color"
+            print_card "$clean_dom" "$stack" "$result_label" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$ip" "$sni" "$pq" "$color"
         fi
     done
-    echo -e "\033[32m■\033[0m 合格   \033[1;33m■\033[0m 需人工确认(非h2/存在未知项)   \033[90m■\033[0m 不合格(非TLS1.3/确认CDN/确认跳转/证书不合法或无效/确认非X25519)   \033[36m■\033[0m 无DNS记录"
-    echo -e "\033[2m  注: CDN列综合CNAME/Cloudflare官方IP段/响应头；跳转仅判301/302/303/307/308。SNI可单独指定，默认等于target。\033[0m"
-    echo -e "\033[2m      PQ列来自可选的官方 xray tls ping；未安装xray时为“未检测”，不会因此判失败。官方文档明确建议用该命令检查 X25519MLKEM768。\033[0m"
+    echo -e "\033[32m■\033[0m 推荐   \033[1;33m■\033[0m 硬条件通过但有警告   \033[90m■\033[0m 不合格(仅硬条件)   \033[36m■\033[0m 无DNS记录"
+    echo -e "\033[2m  硬条件：TLS1.3、不能确认使用CDN、不能确认301/302/303/307/308跳转、证书不能明确失效。\033[0m"
+    echo -e "\033[2m  ALPN/H2、X25519、未知项只作为警告，不再一票否决；IPv4/IPv6分别判断，一个协议栈失败不会拖死另一个。\033[0m"
+    echo -e "\033[2m  CDN综合CNAME/Cloudflare官方IP段/响应头；PQ来自可选 xray tls ping，仅作信息项。SNI默认等于target。\033[0m"
 
     rm -rf "$tmp_dir"
 done
