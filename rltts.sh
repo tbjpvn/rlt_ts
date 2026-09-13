@@ -8,6 +8,7 @@ CONNECT_TIMEOUT=6
 MAX_TIME=10
 RETRY_TIMES=3        # 握手失败时的重试次数（含首次），提高容错，避免一次性网络抖动导致误判FAIL
 
+# reality_test_v5 - 双栈DNS/IPv4/IPv6独立检测版
 # ---------- CDN 判定相关配置 ----------
 # 纯响应头嗅探能被CDN/源站轻易隐藏（很多CDN默认不会给正常200响应注入身份头，
 # 例如 Akamai 只在自己生成的错误页上才带 AkamaiGHost，正常回源透传的响应完全测不出来）。
@@ -70,7 +71,7 @@ print_row() {
         "$(pad_field "$4" 7)" "$(pad_field "$5" 4)" "$(pad_field "$6" 2)" \
         "$(pad_field "$7" 3)" "$(pad_field "$8" 5)" "$(pad_field "$9" 5)" \
         "$(pad_field "${10}" 6)" \
-        "\033[0m"
+        "$(printf "\033[0m")"
 }
 
 print_detail() {
@@ -231,22 +232,36 @@ test_domain() {
         return
     fi
 
-    # 先检查该协议栈是否存在对应的DNS记录（A/AAAA）。没有记录不等于连接失败，
-    # 单独标记为"无记录"，避免和真正的连接失败混在一起误判
-    if command -v getent >/dev/null 2>&1; then
-        if [ "$stack" = "6" ]; then
-            if ! getent ahostsv6 "$x" >/dev/null 2>&1; then
-                echo "4|$label|无AAAA记录|-|-|-|-|-|9999|-|$sni|-" >> "$outfile"
-                echo -e "\033[90m○ 无IPv6记录: $label\033[0m" >&2
-                return
-            fi
-        else
-            if ! getent ahostsv4 "$x" >/dev/null 2>&1; then
-                echo "4|$label|无A记录|-|-|-|-|-|9999|-|$sni|-" >> "$outfile"
-                echo -e "\033[90m○ 无IPv4记录: $label\033[0m" >&2
-                return
-            fi
+    # DNS检查：不要只依赖 getent。部分 VPS 的 NSS/resolv 配置会让 getent
+    # 查不到记录，但 curl/dig 实际可以正常解析；否则会把大量真实域名误报成“无DNS”。
+    # 优先用 dig 精确检查 A/AAAA；没有 dig 时再用 getent；两者都没有才交给 curl 最终判断。
+    local dns_ok=0 dns_type
+    if [ "$stack" = "6" ]; then dns_type="AAAA"; else dns_type="A"; fi
+
+    if command -v dig >/dev/null 2>&1; then
+        if dig +short +time=3 +tries=1 "$dns_type" "$x" 2>/dev/null | grep -qE '^[0-9A-Fa-f:.]+$'; then
+            dns_ok=1
         fi
+    elif command -v getent >/dev/null 2>&1; then
+        if [ "$stack" = "6" ]; then
+            getent ahostsv6 "$x" >/dev/null 2>&1 && dns_ok=1
+        else
+            getent ahostsv4 "$x" >/dev/null 2>&1 && dns_ok=1
+        fi
+    else
+        # 没有可靠的DNS工具时，不预判“无记录”，直接让 curl 尝试。
+        dns_ok=1
+    fi
+
+    if [ "$dns_ok" -eq 0 ]; then
+        if [ "$stack" = "6" ]; then
+            echo "4|$label|无AAAA记录|-|-|-|-|-|9999|-|$sni|-" >> "$outfile"
+            echo -e "\033[90m○ 无IPv6记录: $label\033[0m" >&2
+        else
+            echo "4|$label|无A记录|-|-|-|-|-|9999|-|$sni|-" >> "$outfile"
+            echo -e "\033[90m○ 无IPv4记录: $label\033[0m" >&2
+        fi
+        return
     fi
 
     # 第一次探测（含一次自动重试，应对偶发抖动）
