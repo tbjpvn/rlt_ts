@@ -166,13 +166,23 @@ test_domain() {
         a="非h2"
     fi
 
-    # Cloudflare 判断依赖真实HTTP响应头；如果HTTP层完全没有响应（反爬拦截/超时），
-    # 没有任何响应头可看，这时不能默认判"否"，标记为"未知"更准确
+    # CDN 判断依赖真实HTTP响应头；如果HTTP层完全没有响应（反爬拦截/超时），
+    # 没有任何响应头可看，这时不能默认判"否"，标记为"未知"更准确。
+    # 注意：不只测Cloudflare，官方REALITY文档原话是"如果target网站的IP地址特殊（如使用了
+    # CloudFlare CDN的网站）"——Cloudflare只是举例，真正要避开的是任何CDN共享IP节点，
+    # 所以这里覆盖了主流CDN厂商的特征响应头。
     local http_responded=0
     echo "$o" | grep -q "^< " && http_responded=1
 
     if [ "$http_responded" -eq 1 ]; then
-        if echo "$o" | grep -iqE "^< server: cloudflare|^< cf-ray:|^< cf-cache-status:|^< cf-mitigated:"; then
+        if echo "$o" | grep -iqE \
+            "^< server: cloudflare|^< cf-ray:|^< cf-cache-status:|^< cf-mitigated:|\
+^< server: akamaighost|^< x-akamai|\
+^< server: cloudfront|^< x-amz-cf-id|^< x-amz-cf-pop|\
+^< server: fastly|^< x-served-by:|^< x-fastly-request-id|\
+^< x-azure-ref|^< server: ecacc|\
+^< x-iinfo:|^< x-cdn:|\
+^< x-cache:.*(hit|miss)|^< via:.*(cdn|varnish)"; then
             c="是"
         else
             c="否"
@@ -226,11 +236,11 @@ test_domain() {
     # 四档状态：
     # 3=不合格——只要满足以下任意一条就直接判不合格（不需要同时满足）：
     #     a) TLS版本不是1.3
-    #     b) 明确检测到是Cloudflare
+    #     b) 明确检测到使用了CDN
     #     c) 证书不合法（链不受信）或不在有效期内（已过期/未生效）
     #     d) 明确检测到不支持X25519
     # 1=合格但ALPN不是h2——单独拎出来标黄，因为非h2的站点有些实际也能用，不直接判死
-    # 0=完全合格（TLS1.3 + 非CF + 证书合法有效 + 支持X25519 + h2）
+    # 0=完全合格（TLS1.3 + 非CDN + 证书合法有效 + 支持X25519 + h2）
     # 4=该协议栈无DNS记录（在上面已提前返回，这里不会用到）
     local status x25519="未知"
 
@@ -241,7 +251,7 @@ test_domain() {
     elif [ "$cert_status" = "不合法" ] || [ "$cert_status" = "已过期" ] || [ "$cert_status" = "未生效" ]; then
         status=3
     else
-        # TLS1.3确认成立，非CF，证书合法且在有效期内，继续查X25519
+        # TLS1.3确认成立，非CDN，证书合法且在有效期内，继续查X25519
         if [ "$CURVES_SUPPORTED" -eq 1 ]; then
             local x_ok=1 x_try
             for ((x_try = 0; x_try < 2; x_try++)); do
@@ -266,7 +276,7 @@ test_domain() {
             status=0
         fi
 
-        # 兜底检查：只要CF、X25519、证书这几项里有任何一项是"未知"（没能确认清楚），
+        # 兜底检查：只要CDN、X25519、证书这几项里有任何一项是"未知"（没能确认清楚），
         # 就不能算完全合格，哪怕其它条件都过了，也要降到黄色去人工确认
         if [ "$status" -eq 0 ] && { [ "$c" = "未知" ] || [ "$x25519" = "未知" ] || [ "$cert_status" = "未知" ]; }; then
             status=1
@@ -324,7 +334,7 @@ while true; do
     wait
 
     echo ""
-    print_row "域名" "TLS版本" "ALPN" "CF" "X25519" "证书" "平均耗时" "解析IP" "\033[1;33m"
+    print_row "域名" "TLS版本" "ALPN" "CDN" "X25519" "证书" "平均耗时" "解析IP" "\033[1;33m"
     echo -e "\033[1;33m----------------------------------------------------------------------------------------------\033[0m"
 
     sort -t'|' -k1,1n -k8,8n "$result_file" | while IFS='|' read -r status dom tls alpn cf x25519 cert hs ip; do
@@ -340,7 +350,7 @@ while true; do
             print_row "$dom" "$tls" "$alpn" "$cf" "$x25519" "$cert" "${hs}s" "$ip" "$color"
         fi
     done
-    echo -e "\033[32m■\033[0m 合格   \033[1;33m■\033[0m 需人工确认(非h2/存在未知项)   \033[90m■\033[0m 不合格(非TLS1.3/确认CF/证书不合法或无效/确认非X25519)   \033[36m■\033[0m 无DNS记录"
+    echo -e "\033[32m■\033[0m 合格   \033[1;33m■\033[0m 需人工确认(非h2/存在未知项)   \033[90m■\033[0m 不合格(非TLS1.3/确认CDN/证书不合法或无效/确认非X25519)   \033[36m■\033[0m 无DNS记录"
 
     rm -rf "$tmp_dir"
 done
