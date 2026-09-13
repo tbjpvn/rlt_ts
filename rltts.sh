@@ -56,15 +56,27 @@ pad_field() {
     printf '%s%*s' "$s" "$sp" ""
 }
 
-# 打印表格一行，$1-$9 为各列内容，$10 为颜色码
+# 打印表格一行，$1-$9 为各列内容，$10 为颜色码。
+# 各列宽度按实际会出现的最长内容收紧过（比如"证书"最长是"不合法/已过期/未生效"六个显示宽度），
+# 最后一列(解析IP)不再补齐空格——反正后面没有别的列需要对齐，补了也是浪费宽度。
 print_row() {
     local color="${10}"
     printf "%b%s | %s | %s | %s | %s | %s | %s | %s | %s%b\n" \
         "$color" \
-        "$(pad_field "$1" 34)" "$(pad_field "$2" 9)" "$(pad_field "$3" 7)" \
-        "$(pad_field "$4" 6)" "$(pad_field "$5" 8)" "$(pad_field "$6" 8)" \
-        "$(pad_field "$7" 10)" "$(pad_field "$8" 15)" "$(pad_field "$9" 14)" \
+        "$(pad_field "$1" 30)" "$(pad_field "$2" 10)" "$(pad_field "$3" 5)" \
+        "$(pad_field "$4" 5)" "$(pad_field "$5" 5)" "$(pad_field "$6" 5)" \
+        "$(pad_field "$7" 7)" "$(pad_field "$8" 9)" "$9" \
         "\033[0m"
+}
+
+# 窄终端（比如手机SSH客户端）下表格必然会被撑得换行、把每一列拆散对不齐，
+# 与其硬凑表格，不如每条记录单独输出几行——不管域名或IPv6多长，自然换行也不会破坏可读性。
+print_card() {
+    local dom="$1" tls="$2" alpn="$3" cf="$4" redirect="$5" x25519="$6" cert="$7" hs="$8" ip="$9" color="${10}"
+    printf "%b● %s\033[0m\n" "$color" "$dom"
+    printf "%b  TLS:%s ALPN:%s CDN:%s 跳转:%s X25519:%s 证书:%s\033[0m\n" \
+        "$color" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert"
+    printf "%b  耗时:%s  IP:%s\033[0m\n" "$color" "$hs" "$ip"
 }
 
 # ---------- 依赖检查 ----------
@@ -431,6 +443,19 @@ test_domain() {
 check_deps
 detect_utf8_locale
 
+# 表格模式需要较宽的终端才不会自己把行撑得换行（尤其是IPv6地址普遍20+字符）。
+# 手机SSH客户端这类窄终端下，硬凑表格只会把每一列拆到下一行、完全对不齐，
+# 不如自动降级成每条记录几行的紧凑格式，内容多长都不影响可读性。
+TERM_COLS=$(tput cols 2>/dev/null)
+[[ "$TERM_COLS" =~ ^[0-9]+$ ]] || TERM_COLS=80
+TABLE_MIN_COLS=120   # 表格全部列宽之和 + 一个较长IPv6地址，大致需要这个宽度才不会换行
+if [ "$TERM_COLS" -lt "$TABLE_MIN_COLS" ]; then
+    TABLE_MODE=0
+    echo -e "\033[1;33m[提示] 检测到终端宽度($TERM_COLS列)较窄，结果将以紧凑卡片格式显示而非表格。\033[0m" >&2
+else
+    TABLE_MODE=1
+fi
+
 while true; do
     echo ""
     printf "\033[1;36m请输入域名（空格隔开，0卸载并退出）: \033[0m"
@@ -470,8 +495,10 @@ while true; do
     wait
 
     echo ""
-    print_row "域名" "TLS版本" "ALPN" "CDN" "跳转" "X25519" "证书" "平均耗时" "解析IP" "\033[1;33m"
-    echo -e "\033[1;33m----------------------------------------------------------------------------------------------\033[0m"
+    if [ "$TABLE_MODE" -eq 1 ]; then
+        print_row "域名" "TLS版本" "ALPN" "CDN" "跳转" "X25519" "证书" "平均耗时" "解析IP" "\033[1;33m"
+        echo -e "\033[1;33m----------------------------------------------------------------------------------------------------\033[0m"
+    fi
 
     sort -t'|' -k1,1n -k9,9n "$result_file" | while IFS='|' read -r status dom tls alpn cf redirect x25519 cert hs ip; do
         case "$status" in
@@ -481,9 +508,14 @@ while true; do
             *) color="\033[90m" ;;
         esac
         if [ "$status" = "4" ]; then
-            print_row "$dom" "$tls" "-" "-" "-" "-" "-" "-" "-" "$color"
+            alpn="-"; cf="-"; redirect="-"; x25519="-"; cert="-"; hs="-"; ip="-"
         else
-            print_row "$dom" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "${hs}s" "$ip" "$color"
+            hs="${hs}s"
+        fi
+        if [ "$TABLE_MODE" -eq 1 ]; then
+            print_row "$dom" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$ip" "$color"
+        else
+            print_card "$dom" "$tls" "$alpn" "$cf" "$redirect" "$x25519" "$cert" "$hs" "$ip" "$color"
         fi
     done
     echo -e "\033[32m■\033[0m 合格   \033[1;33m■\033[0m 需人工确认(非h2/存在未知项)   \033[90m■\033[0m 不合格(非TLS1.3/确认CDN/确认跳转/证书不合法或无效/确认非X25519)   \033[36m■\033[0m 无DNS记录"
