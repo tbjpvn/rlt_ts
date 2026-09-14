@@ -12,6 +12,12 @@ CDN_CNAME_REGEX='akamai(edge|ized|hd)?\.net$|edgesuite\.net$|edgekey\.net$|akadn
 CF_RANGES_CACHE_DIR="${TMPDIR:-/tmp}/reality_test_cf_ranges"
 CF_RANGES_TTL=86400
 
+# 异常SNI探测：命中即视为存在云厂商L7网关/负载均衡兜底（Application Gateway、
+# CloudFront、云ELB等），常规请求下即使响应头干净(如Server: Apache)也判定为CDN。
+GATEWAY_PROBE_REGEX='application[-_ ]?gateway|cloudfront|x-azure-ref|x-amz-cf|awselb|awsalb|cloudflare|cf-ray|sni-hole|akamaighost|edgekey'
+GATEWAY_PROBE_TIMEOUT=6
+TIMEOUT_AVAILABLE=1
+
 # ---------- 中英文混排对齐 ----------
 UTF8_LOCALE=""
 detect_utf8_locale() {
@@ -84,6 +90,11 @@ check_deps() {
     if ! command -v dig >/dev/null 2>&1; then
         DIG_AVAILABLE=0
         echo -e "\033[1;33m[提示] 未找到 dig（可安装 dnsutils/bind-utils），将跳过CNAME链追溯，CDN判定只能依赖IP段与响应头，准确度会下降。\033[0m"
+    fi
+
+    if ! command -v timeout >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+        TIMEOUT_AVAILABLE=0
+        echo -e "\033[1;33m[提示] 未找到 timeout 或 openssl，将跳过「异常SNI探测网关」这一环，无法识别常规请求下伪装干净、但异常SNI会暴露云网关(如Azure Application Gateway)身份的源站。\033[0m"
     fi
 
     mkdir -p "$CF_RANGES_CACHE_DIR" 2>/dev/null
@@ -209,6 +220,46 @@ ip_in_cidr() {
     [ "$ip_int" -lt 0 ] && return 1
     [ "$cidr_mask" -eq 0 ] && { mask=0; } || mask=$(( 0xFFFFFFFF << (32 - cidr_mask) & 0xFFFFFFFF ))
     [ $(( ip_int & mask )) -eq $(( cidr_int & mask )) ]
+}
+
+# ---------- 异常SNI探测：识破"平时干净、异常请求才暴露"的云网关 ----------
+# 原理：给目标IP发一个不匹配任何真实vhost的SNI（随机生成，几乎不可能撞上），
+# 如果背后是Azure Application Gateway / CloudFront / 云ELB 这类L7网关，
+# 网关会在到达真实源站之前自己兜底响应（400/403 + 网关品牌头，或返回一张
+# 占位自签证书，CN类似 sni-hole.invalid / no-sni 等）。裸VPS/独立源站则没有
+# 这一层，异常SNI要么直接握手失败/RST，要么原样命中默认vhost或源站自身报错，
+# 不会出现云厂商品牌特征。
+# 仅支持IPv4；返回命中的特征字符串并 return 0，未命中 return 1。
+probe_sni_gateway() {
+    local ip="$1"
+    [ -z "$ip" ] && return 1
+    [ "$TIMEOUT_AVAILABLE" -eq 1 ] || return 1
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+
+    local probe_sni="reality-probe-${RANDOM}${RANDOM}.invalid"
+    local raw
+    raw=$(printf 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$probe_sni" \
+            | timeout "$GATEWAY_PROBE_TIMEOUT" openssl s_client -connect "${ip}:443" \
+                -servername "$probe_sni" -quiet 2>&1)
+
+    [ -z "$raw" ] && return 1
+
+    local hit
+    hit=$(echo "$raw" | grep -oiE "$GATEWAY_PROBE_REGEX" | head -n1)
+    if [ -n "$hit" ]; then
+        echo "$hit"
+        return 0
+    fi
+
+    # 兜底：网关在SNI不匹配时常见的占位/自签证书CN特征
+    local cn
+    cn=$(echo "$raw" | grep -o 'CN\s*=\s*[^,/]*' | head -n1 | sed 's/^CN *= *//')
+    if echo "$cn" | grep -qiE 'invalid$|no-?sni|no-?match|default|placeholder|unrecognized|sni-hole'; then
+        echo "证书CN异常(${cn:-未知})"
+        return 0
+    fi
+
+    return 1
 }
 
 ip_is_cloudflare() {
@@ -346,6 +397,16 @@ test_domain() {
         fi
     else
         c="未知"
+    fi
+
+    # 前三项(CNAME/Cloudflare IP段/正常响应头)都没命中时，再做一次异常SNI探测，
+    # 识别"平时表现干净、异常请求才暴露"的云网关(如Azure Application Gateway)。
+    if [ "$c" != "是" ]; then
+        local sni_hit
+        sni_hit=$(probe_sni_gateway "$ip")
+        if [ -n "$sni_hit" ]; then
+            c="是"; cdn_via="SNI探测(网关:$sni_hit)"
+        fi
     fi
 
     if [ "$c" = "是" ]; then
@@ -529,7 +590,8 @@ while true; do
 
     echo -e "\033[32m■\033[0m 合格   \033[1;33m■\033[0m 需人工确认(非h2/存在未知项)   \033[90m■\033[0m 不合格(非TLS1.3/国内IP/确认CDN/确认跳转/证书问题/确认非X25519)   \033[36m■\033[0m 无DNS记录"
     echo -e "\033[2m  官方最低标准：国外网站 + TLSv1.3 + H2 + 域名非跳转用。本脚本额外把 CDN、证书有效性、X25519 作为硬性条件（实战必要）。\033[0m"
-    echo -e "\033[2m  CDN 综合了 CNAME链 / Cloudflare官方IP段 / 响应头三种信号；地区=CN 直接不合格（符合官方「国外网站」要求）。\033[0m"
+    echo -e "\033[2m  CDN 综合了 CNAME链 / Cloudflare官方IP段 / 响应头 / 异常SNI探测网关兜底特征 四种信号；地区=CN 直接不合格（符合官方「国外网站」要求）。\033[0m"
+    echo -e "\033[2m  异常SNI探测：用随机不匹配的SNI单独握手一次，若命中Application Gateway/CloudFront/云ELB等品牌特征或占位自签证书，即使正常访问表现干净也判定为CDN。\033[0m"
     echo -e "\033[2m  如需进一步确认后量子密钥交换(X25519MLKEM768)，官方建议额外执行: xray tls ping <域名>\033[0m"
 
     rm -rf "$tmp_dir"
