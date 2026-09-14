@@ -1,24 +1,20 @@
 #!/bin/bash
 
-MAX_JOBS=8          # 并发数
-SAMPLE_TIMES=3       # 每个域名握手耗时采样次数（仅在首次探测成功后进行）
+MAX_JOBS=8
+SAMPLE_TIMES=3
 CONNECT_TIMEOUT=6
 MAX_TIME=10
-RETRY_TIMES=3        # 握手失败时的重试次数（含首次）
+RETRY_TIMES=3
 
-# ---------- CDN 判定相关配置 ----------
 DIG_AVAILABLE=1
 CDN_CNAME_REGEX='akamai(edge|ized|hd)?\.net$|edgesuite\.net$|edgekey\.net$|akadns\.net$|cloudfront\.net$|fastly(lb)?\.net$|fastlyedge\.net$|azureedge\.net$|azurefd\.net$|msecnd\.net$|trafficmanager\.net$|incapdns\.net$|impervadns\.net$|sucuri\.net$|kxcdn\.com$|b-cdn\.net$|stackpathdns\.com$|hwcdn\.net$|cachefly\.net$|llnwd\.net$|footprint\.net$|edgecastcdn\.net$|cdn77\.(org|net)$|alikunlun\.com$|kunlun[a-z0-9]*\.com$|tbcache\.com$|wswitch\.[a-z0-9.]*cache\.com$|qcloudcdn\.com$|cdn\.dnsv1\.com$|tencent-cloud\.net$|bdydns\.com$|bcelive\.com$|chinacache\.net$|lxdns\.com$|ourwebpic\.com$|wsdvs\.com$|wscdns\.com$|wscloudcdn\.com$|upaiyun\.com$|qiniudns\.com$|qbox\.me$|jiashule\.(com|org)$|jiasule\.(com|org)$'
 CF_RANGES_CACHE_DIR="${TMPDIR:-/tmp}/reality_test_cf_ranges"
 CF_RANGES_TTL=86400
 
-# 异常SNI探测：命中即视为存在云厂商L7网关/负载均衡兜底（Application Gateway、
-# CloudFront、云ELB等），常规请求下即使响应头干净(如Server: Apache)也判定为CDN。
 GATEWAY_PROBE_REGEX='application[-_ ]?gateway|cloudfront|x-azure-ref|x-amz-cf|awselb|awsalb|cloudflare|cf-ray|sni-hole|akamaighost|edgekey'
 GATEWAY_PROBE_TIMEOUT=6
 TIMEOUT_AVAILABLE=1
 
-# ---------- 中英文混排对齐 ----------
 UTF8_LOCALE=""
 detect_utf8_locale() {
     local loc cc
@@ -71,7 +67,6 @@ print_card() {
     printf "%b  耗时:%s  IP:%s\033[0m\n" "$color" "$hs" "$ip"
 }
 
-# ---------- 依赖检查 ----------
 check_deps() {
     for bin in curl awk sort; do
         command -v "$bin" >/dev/null 2>&1 || { echo -e "\033[1;31m[错误] 缺少依赖: $bin，请先安装。\033[0m"; exit 1; }
@@ -120,10 +115,6 @@ check_deps() {
     detect_nat64_prefix
 }
 
-# ---------- NAT64/DNS64 探测 ----------
-# ipv4only.arpa 是 RFC 7050 定义的专用探测域名：只有A记录、无真实AAAA。
-# 如果本机/本网络存在DNS64，查询它的AAAA会返回一个"合成"地址，
-# 从中即可提取出NAT64前缀，用于后续过滤掉伪造的IPv6结果。
 NAT64_PREFIX=""
 detect_nat64_prefix() {
     local addr
@@ -133,13 +124,11 @@ detect_nat64_prefix() {
         addr=$(getent ahostsv6 ipv4only.arpa 2>/dev/null | awk '{print $1}' | grep -v '^::ffff:' | head -n1)
     fi
     if [ -n "$addr" ]; then
-        # 取前96位（前4个冒号分组）作为前缀，标准NAT64前缀长度为/96
         NAT64_PREFIX=$(echo "$addr" | awk -F: '{printf "%s:%s:%s:%s:", $1,$2,$3,$4}')
         echo -e "\033[1;33m[提示] 检测到本机网络存在 DNS64/NAT64（合成前缀: ${NAT64_PREFIX}/96），将自动过滤该前缀下的伪造IPv6结果，避免把「实际走v4」的域名误判为支持IPv6。\033[0m" >&2
     fi
 }
 
-# ---------- 域名格式清洗与校验 ----------
 clean_domain() {
     local raw="$1"
     raw="${raw#http://}"
@@ -155,7 +144,6 @@ is_valid_domain() {
     [[ "$dom" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]
 }
 
-# ---------- 真实AAAA记录判定（过滤v4映射地址与NAT64合成地址） ----------
 has_real_aaaa() {
     local dom="$1" addr
     local list
@@ -167,10 +155,10 @@ has_real_aaaa() {
     while IFS= read -r addr; do
         [ -z "$addr" ] && continue
         case "$addr" in
-            ::ffff:*) continue ;;   # IPv4映射地址，非真实IPv6
+            ::ffff:*) continue ;;
         esac
         if [ -n "$NAT64_PREFIX" ] && [[ "$addr" == ${NAT64_PREFIX}* ]]; then
-            continue                 # 本机DNS64合成的NAT64地址，非真实IPv6
+            continue
         fi
         echo "$addr"
         return 0
@@ -178,7 +166,6 @@ has_real_aaaa() {
     return 1
 }
 
-# ---------- CDN 判定辅助函数 ----------
 get_cname_chain() {
     local dom="$1" cur="$1" chain="" next hops=0
     while [ $hops -lt 10 ]; do
@@ -222,14 +209,6 @@ ip_in_cidr() {
     [ $(( ip_int & mask )) -eq $(( cidr_int & mask )) ]
 }
 
-# ---------- 异常SNI探测：识破"平时干净、异常请求才暴露"的云网关 ----------
-# 原理：给目标IP发一个不匹配任何真实vhost的SNI（随机生成，几乎不可能撞上），
-# 如果背后是Azure Application Gateway / CloudFront / 云ELB 这类L7网关，
-# 网关会在到达真实源站之前自己兜底响应（400/403 + 网关品牌头，或返回一张
-# 占位自签证书，CN类似 sni-hole.invalid / no-sni 等）。裸VPS/独立源站则没有
-# 这一层，异常SNI要么直接握手失败/RST，要么原样命中默认vhost或源站自身报错，
-# 不会出现云厂商品牌特征。
-# 仅支持IPv4；返回命中的特征字符串并 return 0，未命中 return 1。
 probe_sni_gateway() {
     local ip="$1"
     [ -z "$ip" ] && return 1
@@ -251,7 +230,6 @@ probe_sni_gateway() {
         return 0
     fi
 
-    # 兜底：网关在SNI不匹配时常见的占位/自签证书CN特征
     local cn
     cn=$(echo "$raw" | grep -o 'CN\s*=\s*[^,/]*' | head -n1 | sed 's/^CN *= *//')
     if echo "$cn" | grep -qiE 'invalid$|no-?sni|no-?match|default|placeholder|unrecognized|sni-hole'; then
@@ -274,9 +252,6 @@ ip_is_cloudflare() {
     return 1
 }
 
-# 获取 IP 所属国家代码（优先 ipinfo.io，失败则尝试 api.ip.sb）
-# stack: 4/6，显式绑定协议栈，避免协商耗时；单栈v6环境下适当放宽超时+重试，
-# 因为部分GeoIP服务可能需要经NAT64网关中转，RTT比原生连接更高。
 get_country_code() {
     local ip="$1" stack="$2" cc="" flag="" try
     local ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -295,7 +270,6 @@ get_country_code() {
     echo ""
 }
 
-# ---------- 单域名测试 ----------
 test_domain() {
     local x="$1"
     local stack="$2"
@@ -359,7 +333,6 @@ test_domain() {
         a="非h2"
     fi
 
-    # 地区检查（官方要求：国外网站）
     region=$(get_country_code "$ip" "$stack")
     [ -z "$region" ] && region="未知"
     if [ "$region" = "CN" ]; then
@@ -399,8 +372,6 @@ test_domain() {
         c="未知"
     fi
 
-    # 前三项(CNAME/Cloudflare IP段/正常响应头)都没命中时，再做一次异常SNI探测，
-    # 识别"平时表现干净、异常请求才暴露"的云网关(如Azure Application Gateway)。
     if [ "$c" != "是" ]; then
         local sni_hit
         sni_hit=$(probe_sni_gateway "$ip")
@@ -461,11 +432,10 @@ test_domain() {
 
     local status x25519="未知"
 
-    # 硬性不合格条件（官方最低标准 + 实战必要项）
     if [ "$t" != "TLSv1.3" ]; then
         status=3
     elif [ "$region" = "国内" ]; then
-        status=3   # 官方明确要求国外网站
+        status=3
     elif [ "$c" = "是" ]; then
         status=3
     elif [ "$redirect" = "是" ]; then
@@ -497,7 +467,6 @@ test_domain() {
             status=0
         fi
 
-        # 存在未知项时降级到黄色，方便人工确认
         if [ "$status" -eq 0 ] && { [ "$c" = "未知" ] || [ "$redirect" = "未知" ] || [ "$x25519" = "未知" ] || [ "$cert_status" = "未知" ] || [ "$region" = "未知" ]; }; then
             status=1
         fi
@@ -511,7 +480,6 @@ test_domain() {
     esac
 }
 
-# ---------- 主循环 ----------
 check_deps
 detect_utf8_locale
 
