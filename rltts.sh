@@ -105,6 +105,27 @@ check_deps() {
         CURVES_SUPPORTED=0
         echo -e "\033[1;33m[提示] curl 版本 ($curl_ver) 过低，不支持 --curves 参数，将无法检测 X25519 密钥交换支持（需要 7.73.0+）。\033[0m"
     fi
+
+    detect_nat64_prefix
+}
+
+# ---------- NAT64/DNS64 探测 ----------
+# ipv4only.arpa 是 RFC 7050 定义的专用探测域名：只有A记录、无真实AAAA。
+# 如果本机/本网络存在DNS64，查询它的AAAA会返回一个"合成"地址，
+# 从中即可提取出NAT64前缀，用于后续过滤掉伪造的IPv6结果。
+NAT64_PREFIX=""
+detect_nat64_prefix() {
+    local addr
+    if [ "$DIG_AVAILABLE" -eq 1 ]; then
+        addr=$(dig +short AAAA ipv4only.arpa 2>/dev/null | grep -E '^[0-9a-fA-F:]+$' | head -n1)
+    else
+        addr=$(getent ahostsv6 ipv4only.arpa 2>/dev/null | awk '{print $1}' | grep -v '^::ffff:' | head -n1)
+    fi
+    if [ -n "$addr" ]; then
+        # 取前96位（前4个冒号分组）作为前缀，标准NAT64前缀长度为/96
+        NAT64_PREFIX=$(echo "$addr" | awk -F: '{printf "%s:%s:%s:%s:", $1,$2,$3,$4}')
+        echo -e "\033[1;33m[提示] 检测到本机网络存在 DNS64/NAT64（合成前缀: ${NAT64_PREFIX}/96），将自动过滤该前缀下的伪造IPv6结果，避免把「实际走v4」的域名误判为支持IPv6。\033[0m" >&2
+    fi
 }
 
 # ---------- 域名格式清洗与校验 ----------
@@ -121,6 +142,29 @@ clean_domain() {
 is_valid_domain() {
     local dom="$1"
     [[ "$dom" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]
+}
+
+# ---------- 真实AAAA记录判定（过滤v4映射地址与NAT64合成地址） ----------
+has_real_aaaa() {
+    local dom="$1" addr
+    local list
+    if [ "$DIG_AVAILABLE" -eq 1 ]; then
+        list=$(dig +short AAAA "$dom" 2>/dev/null | grep -E '^[0-9a-fA-F:]+$')
+    else
+        list=$(getent ahostsv6 "$dom" 2>/dev/null | awk '{print $1}')
+    fi
+    while IFS= read -r addr; do
+        [ -z "$addr" ] && continue
+        case "$addr" in
+            ::ffff:*) continue ;;   # IPv4映射地址，非真实IPv6
+        esac
+        if [ -n "$NAT64_PREFIX" ] && [[ "$addr" == ${NAT64_PREFIX}* ]]; then
+            continue                 # 本机DNS64合成的NAT64地址，非真实IPv6
+        fi
+        echo "$addr"
+        return 0
+    done <<< "$list"
+    return 1
 }
 
 # ---------- CDN 判定辅助函数 ----------
@@ -208,14 +252,16 @@ test_domain() {
         return
     fi
 
-    if command -v getent >/dev/null 2>&1; then
-        if [ "$stack" = "6" ]; then
-            if ! getent ahostsv6 "$x" >/dev/null 2>&1; then
+    if [ "$stack" = "6" ]; then
+        if [ "$DIG_AVAILABLE" -eq 1 ] || command -v getent >/dev/null 2>&1; then
+            if ! has_real_aaaa "$x" >/dev/null; then
                 echo "4|$label|无AAAA记录|-|-|-|-|-|9999|-|-" >> "$outfile"
                 echo -e "\033[90m○ 无IPv6记录: $label\033[0m" >&2
                 return
             fi
-        else
+        fi
+    else
+        if command -v getent >/dev/null 2>&1; then
             if ! getent ahostsv4 "$x" >/dev/null 2>&1; then
                 echo "4|$label|无A记录|-|-|-|-|-|9999|-|-" >> "$outfile"
                 echo -e "\033[90m○ 无IPv4记录: $label\033[0m" >&2
