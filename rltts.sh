@@ -224,16 +224,24 @@ ip_is_cloudflare() {
 }
 
 # 获取 IP 所属国家代码（优先 ipinfo.io，失败则尝试 api.ip.sb）
+# stack: 4/6，显式绑定协议栈，避免协商耗时；单栈v6环境下适当放宽超时+重试，
+# 因为部分GeoIP服务可能需要经NAT64网关中转，RTT比原生连接更高。
 get_country_code() {
-    local ip="$1" cc=""
+    local ip="$1" stack="$2" cc="" flag="" try
+    local ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     [ -z "$ip" ] && { echo ""; return; }
-    cc=$(curl -s --max-time 3 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '[:space:]')
-    if [ -n "$cc" ] && [ ${#cc} -eq 2 ]; then
-        echo "$cc"
-        return
-    fi
-    cc=$(curl -s --max-time 3 "https://api.ip.sb/geoip/${ip}" 2>/dev/null | grep -o '"country_code":"[A-Z][A-Z]"' | head -n1 | cut -d'"' -f4)
-    echo "$cc"
+    [ -n "$stack" ] && flag="-${stack}"
+
+    for try in 1 2; do
+        cc=$(curl -s $flag -A "$ua" --max-time 5 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '[:space:]')
+        [ -n "$cc" ] && [ ${#cc} -eq 2 ] && { echo "$cc"; return; }
+    done
+
+    for try in 1 2; do
+        cc=$(curl -s $flag -A "$ua" --max-time 5 "https://api.ip.sb/geoip/${ip}" 2>/dev/null | grep -o '"country_code":"[A-Z][A-Z]"' | head -n1 | cut -d'"' -f4)
+        [ -n "$cc" ] && { echo "$cc"; return; }
+    done
+    echo ""
 }
 
 # ---------- 单域名测试 ----------
@@ -301,7 +309,7 @@ test_domain() {
     fi
 
     # 地区检查（官方要求：国外网站）
-    region=$(get_country_code "$ip")
+    region=$(get_country_code "$ip" "$stack")
     [ -z "$region" ] && region="未知"
     if [ "$region" = "CN" ]; then
         region="国内"
