@@ -53,7 +53,7 @@ print_row() {
         "$color" \
         "$(pad_field "$1" 28)" "$(pad_field "$2" 9)" "$(pad_field "$3" 5)" \
         "$(pad_field "$4" 5)" "$(pad_field "$5" 5)" "$(pad_field "$6" 5)" \
-        "$(pad_field "$7" 7)" "$(pad_field "$8" 6)" "$(pad_field "$9" 8)" "$10" \
+        "$(pad_field "$7" 7)" "$(pad_field "$8" 6)" "$(pad_field "$9" 8)" "${10}" \
         "\033[0m"
 }
 
