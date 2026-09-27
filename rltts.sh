@@ -522,7 +522,8 @@ show_title() {
 
 show_menu() {
     echo ""
-    echo -e "\033[1;36m1.\033[0m 设置域名并发数（当前: \033[1;33m$MAX_JOBS\033[0m，默认: 8）并输入域名开始测试"
+    echo -e "\033[1;36m1.\033[0m 输入域名进行测试"
+    echo -e "\033[1;36m2.\033[0m 设置域名并发数（当前: \033[1;33m$MAX_JOBS\033[0m，默认: 8）"
     echo -e "\033[1;36m0.\033[0m 退出并卸载"
     printf "\033[1;36m请选择 [默认: 1]: \033[0m"
 }
@@ -555,20 +556,23 @@ while true; do
         break
     fi
 
-    if [ "$choice" != "1" ]; then
-        echo -e "\033[1;31m[错误] 无效选项，请重新选择。\033[0m"
+    if [ "$choice" = "2" ]; then
+        printf "\033[1;36m请输入新的并发数（当前: %s，回车取消）: \033[0m" "$MAX_JOBS"
+        read -r new_jobs
+        if [ -z "$new_jobs" ]; then
+            continue
+        elif [[ "$new_jobs" =~ ^[0-9]+$ ]] && [ "$new_jobs" -gt 0 ]; then
+            MAX_JOBS="$new_jobs"
+            echo -e "\033[1;32m[OK] 并发数已设置为: $MAX_JOBS\033[0m"
+        else
+            echo -e "\033[1;31m[错误] 请输入一个大于0的整数。\033[0m"
+        fi
         continue
     fi
 
-    printf "\033[1;36m请输入并发数（当前: %s，回车保持不变）: \033[0m" "$MAX_JOBS"
-    read -r new_jobs
-    if [ -n "$new_jobs" ]; then
-        if [[ "$new_jobs" =~ ^[0-9]+$ ]] && [ "$new_jobs" -gt 0 ]; then
-            MAX_JOBS="$new_jobs"
-        else
-            echo -e "\033[1;31m[错误] 请输入一个大于0的整数，已取消本次设置。\033[0m"
-            continue
-        fi
+    if [ "$choice" != "1" ]; then
+        echo -e "\033[1;31m[错误] 无效选项，请重新选择。\033[0m"
+        continue
     fi
 
     printf "\033[1;36m请输入域名（空格隔开）: \033[0m"
